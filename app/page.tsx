@@ -1,3 +1,227 @@
+"use client";
+
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { getSupabaseBrowser } from "@/lib/supabase/browser";
+
+type AnyRow = Record<string, any>;
+// Explicit database row shape for parts/items. Keep these fields aligned with supabase/schema.sql.
+type ProductionItem = AnyRow & {
+  id: string;
+  product_id: string;
+  name: string;
+  target_quantity: number | string;
+  material: string;
+  weight_per_part_g: number | string;
+  print_time_hours: number | string;
+  infill_percent: number | string;
+  wall_loops: number | string;
+  ironing: boolean;
+  notes?: string | null;
+  created_at?: string;
+};
+type DecoratedProductionItem = ProductionItem & { product: string };
+type TotalsAccumulator = { required: number; completed: number; inProduction: number; remaining: number; totalPrintHours: number; materialKg: number; itemsWithQty: number };
+type Tab = "overview" | "production" | "jobs" | "team";
+type Toast = { kind: "success" | "error" | "info"; text: string } | null;
+const STATUS_LABELS: Record<string, string> = {
+  queued: "Queued", printing: "Printing", failed: "Failed", completed: "Completed", cancelled: "Cancelled",
+};
+const STATUS_CLASS: Record<string, string> = {
+  queued: "queued", printing: "printing", failed: "failed", completed: "completed", cancelled: "cancelled",
+};
+const EMPTY_FORM = { product_id: "", name: "", target_quantity: "0", material: "PLA", weight_per_part_g: "0", print_time_hours: "0", infill_percent: "20", wall_loops: "3", ironing: false, notes: "" };
+
+function fmtNum(value: number, decimals = 0) {
+  return new Intl.NumberFormat("en-IN", { maximumFractionDigits: decimals, minimumFractionDigits: 0 }).format(value || 0);
+}
+function fmtHours(value: number) {
+  if (!value) return "0 h";
+  if (value >= 48) return `${fmtNum(value / 24, 1)} d`;
+  return `${fmtNum(value, 1)} h`;
+}
+function initials(name = "") { return name.split(/[ @._-]/).filter(Boolean).slice(0, 2).map((s) => s[0]?.toUpperCase()).join("") || "U"; }
+
+export default function HomePage() {
+  const supabase = useMemo(() => getSupabaseBrowser(), []);
+  const [configMissing, setConfigMissing] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [sessionUser, setSessionUser] = useState<AnyRow | null>(null);
+  const [role, setRole] = useState("viewer");
+  const [products, setProducts] = useState<AnyRow[]>([]);
+  const [items, setItems] = useState<ProductionItem[]>([]);
+  const [jobs, setJobs] = useState<AnyRow[]>([]);
+  const [members, setMembers] = useState<AnyRow[]>([]);
+  const [tab, setTab] = useState<Tab>("overview");
+  const [loadingData, setLoadingData] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [loginSent, setLoginSent] = useState(false);
+  const [toast, setToast] = useState<Toast>(null);
+  const [search, setSearch] = useState("");
+  const [productFilter, setProductFilter] = useState("all");
+  const [jobStatusFilter, setJobStatusFilter] = useState("all");
+  const [itemModal, setItemModal] = useState<AnyRow | null | false>(false);
+  const [jobModal, setJobModal] = useState(false);
+  const [jobSource, setJobSource] = useState("internal");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("editor");
+  const [inviteBusy, setInviteBusy] = useState(false);
+
+  const canEdit = role === "admin" || role === "editor";
+  const isAdmin = role === "admin";
+
+  const flash = useCallback((kind: "success" | "error" | "info", text: string) => {
+    setToast({ kind, text });
+    window.setTimeout(() => setToast(null), 4200);
+  }, []);
+
+  const loadData = useCallback(async (user: AnyRow) => {
+    if (!supabase) return;
+    setLoadingData(true);
+    const { data: member, error: memberError } = await supabase.from("app_members").select("user_id,email,role,created_at").eq("user_id", user.id).single();
+    if (memberError || !member) {
+      setLoadingData(false);
+      setToast({ kind: "error", text: "This account is not on the PrintOps invite list. Ask an admin to invite your email." });
+      return;
+    }
+    setRole(member.role || "viewer");
+    const [p, i, j] = await Promise.all([
+      supabase.from("products").select("*").order("sort_order"),
+      supabase.from("items").select("*").order("created_at"),
+      supabase.from("print_jobs").select("*").order("created_at", { ascending: false }),
+    ]);
+    const firstError = p.error || i.error || j.error;
+    if (firstError) {
+      setLoadingData(false);
+      setToast({ kind: "error", text: firstError.message });
+      return;
+    }
+    setProducts(p.data || []);
+    setItems(i.data || []);
+    setJobs(j.data || []);
+    if (member.role === "admin") {
+      const { data: m, error: mErr } = await supabase.from("app_members").select("user_id,email,role,created_at").order("created_at", { ascending: false });
+      if (!mErr) setMembers(m || []);
+    } else {
+      setMembers([member]);
+    }
+    setLoadingData(false);
+  }, [supabase]);
+
+  useEffect(() => {
+    if (!supabase) { setConfigMissing(true); setAuthReady(true); return; }
+    let alive = true;
+    supabase.auth.getUser().then(({ data }) => {
+      if (!alive) return;
+      setSessionUser(data.user || null);
+      if (data.user) loadData(data.user);
+      setAuthReady(true);
+    }).catch(() => { if (alive) setAuthReady(true); });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      const user = session?.user || null;
+      setSessionUser(user);
+      if (user) loadData(user);
+      else { setItems([]); setJobs([]); setProducts([]); setMembers([]); setRole("viewer"); }
+    });
+    return () => { alive = false; listener.subscription.unsubscribe(); };
+  }, [supabase, loadData]);
+
+  const productMap = useMemo(() => Object.fromEntries(products.map((p) => [p.id, p])), [products]);
+  // Explicitly preserve all database item fields after adding the display-only product name.
+  const decoratedItems = useMemo<DecoratedProductionItem[]>(
+    () => items.map((item): DecoratedProductionItem => ({
+      ...item,
+      product: String(productMap[item.product_id]?.name || "Unknown product"),
+    })),
+    [items, productMap],
+  );
+  const getItem = useCallback((id: string) => items.find((i) => i.id === id), [items]);
+  const itemStats = useCallback((item: AnyRow) => {
+    const related = jobs.filter((j) => j.item_id === item.id);
+    const completed = related.reduce((n, j) => n + (Number(j.completed_quantity) || 0), 0);
+    const active = related.filter((j) => j.status === "queued" || j.status === "printing");
+    const inProduction = active.reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const printing = active.filter((j) => j.status === "printing").reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const queued = active.filter((j) => j.status === "queued").reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const target = Number(item.target_quantity) || 0;
+    const remaining = Math.max(target - completed, 0);
+    const progress = target > 0 ? Math.min(100, (completed / target) * 100) : 0;
+    return { completed, inProduction, printing, queued, target, remaining, progress, totalJobs: related.length };
+  }, [jobs]);
+
+  const totals = useMemo(() => {
+    return decoratedItems.reduce<TotalsAccumulator>((acc, item) => {
+      const s = itemStats(item);
+      acc.required += s.target;
+      acc.completed += s.completed;
+      acc.inProduction += s.inProduction;
+      acc.remaining += s.remaining;
+      acc.totalPrintHours += s.target * (Number(item.print_time_hours) || 0);
+      acc.materialKg += s.target * (Number(item.weight_per_part_g) || 0) / 1000;
+      if (s.target > 0) acc.itemsWithQty++;
+      return acc;
+    }, { required: 0, completed: 0, inProduction: 0, remaining: 0, totalPrintHours: 0, materialKg: 0, itemsWithQty: 0 });
+  }, [decoratedItems, itemStats]);
+
+  const productSummary = useMemo(() => products.map((p) => {
+    const its = decoratedItems.filter((i) => i.product_id === p.id);
+    return its.reduce((acc, item) => {
+      const s = itemStats(item); acc.required += s.target; acc.completed += s.completed; acc.inProduction += s.inProduction; acc.remaining += s.remaining; acc.lines++;
+      return acc;
+    }, { ...p, required: 0, completed: 0, inProduction: 0, remaining: 0, lines: 0 });
+  }), [products, decoratedItems, itemStats]);
+
+  const filteredItems = useMemo(() => decoratedItems.filter((item) => {
+    const q = search.trim().toLowerCase();
+    return (!q || `${item.name} ${item.product} ${item.material}`.toLowerCase().includes(q)) && (productFilter === "all" || item.product_id === productFilter);
+  }), [decoratedItems, search, productFilter]);
+  const filteredJobs = useMemo(() => jobs.filter((job) => {
+    const item = getItem(job.item_id);
+    const q = search.trim().toLowerCase();
+    return (!q || `${item?.name || ""} ${productMap[item?.product_id]?.name || ""} ${job.printer_name || ""} ${job.vendor_name || ""} ${job.status}`.toLowerCase().includes(q)) && (jobStatusFilter === "all" || job.status === jobStatusFilter);
+  }), [jobs, getItem, productMap, search, jobStatusFilter]);
+
+  async function sendLoginLink(e: FormEvent) {
+    e.preventDefault();
+    if (!supabase || !authEmail.trim()) return;
+    setAuthBusy(true); setToast(null);
+    const { error } = await supabase.auth.signInWithOtp({ email: authEmail.trim().toLowerCase(), options: { emailRedirectTo: `${window.location.origin}/auth/callback`, shouldCreateUser: false } });
+    setAuthBusy(false);
+    if (error) flash("error", error.message);
+    else setLoginSent(true);
+  }
+
+  async function signOut() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    setSessionUser(null); setLoginSent(false); setAuthEmail(""); setToast(null);
+  }
+
+  async function saveItem(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !canEdit) return;
+    const form = new FormData(e.currentTarget);
+    const payload = {
+      product_id: String(form.get("product_id") || ""), name: String(form.get("name") || "").trim(),
+      target_quantity: Math.max(0, Number(form.get("target_quantity") || 0)),
+      material: String(form.get("material") || "PLA"), weight_per_part_g: Math.max(0, Number(form.get("weight_per_part_g") || 0)),
+      print_time_hours: Math.max(0, Number(form.get("print_time_hours") || 0)), infill_percent: Math.max(0, Math.min(100, Number(form.get("infill_percent") || 0))),
+      wall_loops: Math.max(0, Number(form.get("wall_loops") || 0)), ironing: form.get("ironing") === "on", notes: String(form.get("notes") || "").trim(),
+    };
+    const query = itemModal && itemModal.id ? await supabase.from("items").update(payload).eq("id", itemModal.id) : await supabase.from("items").insert(payload);
+    if (query.error) { flash("error", query.error.message); return; }
+    setItemModal(false);
+    if (sessionUser) await loadData(sessionUser);
+    flash("success", itemModal && itemModal.id ? "Item settings saved." : "Item added to production list.");
+  }
+
+  async function addJob(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !canEdit || !sessionUser) return;
+    const form = new FormData(e.currentTarget);
+    const source = String(form.get("source") || "internal");
+    const payload = {
       item_id: String(form.get("item_id") || ""), source,
       printer_name: source === "internal" ? String(form.get("printer_name") || "P1") : null,
       vendor_name: source === "outside" ? String(form.get("vendor_name") || "Fraxus").trim() || "Fraxus" : null,
