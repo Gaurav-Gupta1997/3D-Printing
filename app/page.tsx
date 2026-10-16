@@ -20,6 +20,7 @@ type ProductionItem = AnyRow & {
   created_at?: string;
 };
 type DecoratedProductionItem = ProductionItem & { product: string };
+type ProductSummary = AnyRow & { id: string; name: string; required: number; completed: number; inProduction: number; remaining: number; lines: number };
 type TotalsAccumulator = { required: number; completed: number; inProduction: number; remaining: number; totalPrintHours: number; materialKg: number; itemsWithQty: number };
 type Tab = "overview" | "production" | "jobs" | "team";
 type Toast = { kind: "success" | "error" | "info"; text: string } | null;
@@ -164,12 +165,27 @@ export default function HomePage() {
     }, { required: 0, completed: 0, inProduction: 0, remaining: 0, totalPrintHours: 0, materialKg: 0, itemsWithQty: 0 });
   }, [decoratedItems, itemStats]);
 
-  const productSummary = useMemo(() => products.map((p) => {
+  const productSummary = useMemo<ProductSummary[]>(() => products.map((p): ProductSummary => {
     const its = decoratedItems.filter((i) => i.product_id === p.id);
-    return its.reduce((acc, item) => {
-      const s = itemStats(item); acc.required += s.target; acc.completed += s.completed; acc.inProduction += s.inProduction; acc.remaining += s.remaining; acc.lines++;
+    const initial: ProductSummary = {
+      ...p,
+      id: String(p.id),
+      name: String(p.name || "Unnamed product"),
+      required: 0,
+      completed: 0,
+      inProduction: 0,
+      remaining: 0,
+      lines: 0,
+    };
+    return its.reduce<ProductSummary>((acc, item) => {
+      const s = itemStats(item);
+      acc.required += s.target;
+      acc.completed += s.completed;
+      acc.inProduction += s.inProduction;
+      acc.remaining += s.remaining;
+      acc.lines++;
       return acc;
-    }, { ...p, required: 0, completed: 0, inProduction: 0, remaining: 0, lines: 0 });
+    }, initial);
   }), [products, decoratedItems, itemStats]);
 
   const filteredItems = useMemo(() => decoratedItems.filter((item) => {
