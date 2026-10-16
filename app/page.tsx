@@ -4,6 +4,21 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useSta
 import { getSupabaseBrowser } from "@/lib/supabase/browser";
 
 type AnyRow = Record<string, any>;
+// Explicit database row shape for parts/items. Keep these fields aligned with supabase/schema.sql.
+type ProductionItem = AnyRow & {
+  id: string;
+  product_id: string;
+  name: string;
+  target_quantity: number | string;
+  material: string;
+  weight_per_part_g: number | string;
+  print_time_hours: number | string;
+  infill_percent: number | string;
+  wall_loops: number | string;
+  ironing: boolean;
+  notes?: string | null;
+  created_at?: string;
+};
 type Tab = "overview" | "production" | "jobs" | "team";
 type Toast = { kind: "success" | "error" | "info"; text: string } | null;
 const STATUS_LABELS: Record<string, string> = {
@@ -31,7 +46,7 @@ export default function HomePage() {
   const [sessionUser, setSessionUser] = useState<AnyRow | null>(null);
   const [role, setRole] = useState("viewer");
   const [products, setProducts] = useState<AnyRow[]>([]);
-  const [items, setItems] = useState<AnyRow[]>([]);
+  const [items, setItems] = useState<ProductionItem[]>([]);
   const [jobs, setJobs] = useState<AnyRow[]>([]);
   const [members, setMembers] = useState<AnyRow[]>([]);
   const [tab, setTab] = useState<Tab>("overview");
