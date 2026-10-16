@@ -1,0 +1,356 @@
+"use client";
+
+import { type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { getSupabaseBrowser } from "@/lib/supabase/browser";
+
+type AnyRow = Record<string, any>;
+// Explicit database row shape for parts/items. Keep these fields aligned with supabase/schema.sql.
+type ProductionItem = AnyRow & {
+  id: string;
+  product_id: string;
+  name: string;
+  target_quantity: number | string;
+  material: string;
+  weight_per_part_g: number | string;
+  print_time_hours: number | string;
+  infill_percent: number | string;
+  wall_loops: number | string;
+  ironing: boolean;
+  notes?: string | null;
+  created_at?: string;
+};
+type DecoratedProductionItem = ProductionItem & { product: string };
+type ProductSummary = AnyRow & { id: string; name: string; required: number; completed: number; inProduction: number; remaining: number; lines: number };
+type TotalsAccumulator = { required: number; completed: number; inProduction: number; remaining: number; totalPrintHours: number; materialKg: number; itemsWithQty: number };
+type Tab = "overview" | "production" | "jobs" | "team";
+type Toast = { kind: "success" | "error" | "info"; text: string } | null;
+const STATUS_LABELS: Record<string, string> = {
+  queued: "Queued", printing: "Printing", failed: "Failed", completed: "Completed", cancelled: "Cancelled",
+};
+const STATUS_CLASS: Record<string, string> = {
+  queued: "queued", printing: "printing", failed: "failed", completed: "completed", cancelled: "cancelled",
+};
+const EMPTY_FORM = { product_id: "", name: "", target_quantity: "0", material: "PLA", weight_per_part_g: "0", print_time_hours: "0", infill_percent: "20", wall_loops: "3", ironing: false, notes: "" };
+
+function fmtNum(value: number, decimals = 0) {
+  return new Intl.NumberFormat("en-IN", { maximumFractionDigits: decimals, minimumFractionDigits: 0 }).format(value || 0);
+}
+function fmtHours(value: number) {
+  if (!value) return "0 h";
+  if (value >= 48) return `${fmtNum(value / 24, 1)} d`;
+  return `${fmtNum(value, 1)} h`;
+}
+function initials(name = "") { return name.split(/[ @._-]/).filter(Boolean).slice(0, 2).map((s) => s[0]?.toUpperCase()).join("") || "U"; }
+
+export default function HomePage() {
+  const supabase = useMemo(() => getSupabaseBrowser(), []);
+  const [configMissing, setConfigMissing] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
+  const [sessionUser, setSessionUser] = useState<AnyRow | null>(null);
+  const [role, setRole] = useState("viewer");
+  const [products, setProducts] = useState<AnyRow[]>([]);
+  const [items, setItems] = useState<ProductionItem[]>([]);
+  const [jobs, setJobs] = useState<AnyRow[]>([]);
+  const [members, setMembers] = useState<AnyRow[]>([]);
+  const [tab, setTab] = useState<Tab>("overview");
+  const [loadingData, setLoadingData] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [loginSent, setLoginSent] = useState(false);
+  const [toast, setToast] = useState<Toast>(null);
+  const [search, setSearch] = useState("");
+  const [productFilter, setProductFilter] = useState("all");
+  const [jobStatusFilter, setJobStatusFilter] = useState("all");
+  const [itemModal, setItemModal] = useState<AnyRow | null | false>(false);
+  const [jobModal, setJobModal] = useState(false);
+  const [jobSource, setJobSource] = useState("internal");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("editor");
+  const [inviteBusy, setInviteBusy] = useState(false);
+
+  const canEdit = role === "admin" || role === "editor";
+  const isAdmin = role === "admin";
+
+  const flash = useCallback((kind: "success" | "error" | "info", text: string) => {
+    setToast({ kind, text });
+    window.setTimeout(() => setToast(null), 4200);
+  }, []);
+
+  const loadData = useCallback(async (user: AnyRow) => {
+    if (!supabase) return;
+    setLoadingData(true);
+    const { data: member, error: memberError } = await supabase.from("app_members").select("user_id,email,role,created_at").eq("user_id", user.id).single();
+    if (memberError || !member) {
+      setLoadingData(false);
+      setToast({ kind: "error", text: "This account is not on the PrintOps invite list. Ask an admin to invite your email." });
+      return;
+    }
+    setRole(member.role || "viewer");
+    const [p, i, j] = await Promise.all([
+      supabase.from("products").select("*").order("sort_order"),
+      supabase.from("items").select("*").order("created_at"),
+      supabase.from("print_jobs").select("*").order("created_at", { ascending: false }),
+    ]);
+    const firstError = p.error || i.error || j.error;
+    if (firstError) {
+      setLoadingData(false);
+      setToast({ kind: "error", text: firstError.message });
+      return;
+    }
+    setProducts(p.data || []);
+    setItems(i.data || []);
+    setJobs(j.data || []);
+    if (member.role === "admin") {
+      const { data: m, error: mErr } = await supabase.from("app_members").select("user_id,email,role,created_at").order("created_at", { ascending: false });
+      if (!mErr) setMembers(m || []);
+    } else {
+      setMembers([member]);
+    }
+    setLoadingData(false);
+  }, [supabase]);
+
+  useEffect(() => {
+    if (!supabase) { setConfigMissing(true); setAuthReady(true); return; }
+    let alive = true;
+    supabase.auth.getUser().then(({ data }) => {
+      if (!alive) return;
+      setSessionUser(data.user || null);
+      if (data.user) loadData(data.user);
+      setAuthReady(true);
+    }).catch(() => { if (alive) setAuthReady(true); });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!alive) return;
+      const user = session?.user || null;
+      setSessionUser(user);
+      if (user) loadData(user);
+      else { setItems([]); setJobs([]); setProducts([]); setMembers([]); setRole("viewer"); }
+    });
+    return () => { alive = false; listener.subscription.unsubscribe(); };
+  }, [supabase, loadData]);
+
+  const productMap = useMemo(() => Object.fromEntries(products.map((p) => [p.id, p])), [products]);
+  // Explicitly preserve all database item fields after adding the display-only product name.
+  const decoratedItems = useMemo<DecoratedProductionItem[]>(
+    () => items.map((item): DecoratedProductionItem => ({
+      ...item,
+      product: String(productMap[item.product_id]?.name || "Unknown product"),
+    })),
+    [items, productMap],
+  );
+  const getItem = useCallback((id: string) => items.find((i) => i.id === id), [items]);
+  const itemStats = useCallback((item: AnyRow) => {
+    const related = jobs.filter((j) => j.item_id === item.id);
+    const completed = related.reduce((n, j) => n + (Number(j.completed_quantity) || 0), 0);
+    const active = related.filter((j) => j.status === "queued" || j.status === "printing");
+    const inProduction = active.reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const printing = active.filter((j) => j.status === "printing").reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const queued = active.filter((j) => j.status === "queued").reduce((n, j) => n + Math.max((Number(j.planned_quantity) || 0) - (Number(j.completed_quantity) || 0), 0), 0);
+    const target = Number(item.target_quantity) || 0;
+    const remaining = Math.max(target - completed, 0);
+    const progress = target > 0 ? Math.min(100, (completed / target) * 100) : 0;
+    return { completed, inProduction, printing, queued, target, remaining, progress, totalJobs: related.length };
+  }, [jobs]);
+
+  const totals = useMemo(() => {
+    return decoratedItems.reduce<TotalsAccumulator>((acc, item) => {
+      const s = itemStats(item);
+      acc.required += s.target;
+      acc.completed += s.completed;
+      acc.inProduction += s.inProduction;
+      acc.remaining += s.remaining;
+      acc.totalPrintHours += s.target * (Number(item.print_time_hours) || 0);
+      acc.materialKg += s.target * (Number(item.weight_per_part_g) || 0) / 1000;
+      if (s.target > 0) acc.itemsWithQty++;
+      return acc;
+    }, { required: 0, completed: 0, inProduction: 0, remaining: 0, totalPrintHours: 0, materialKg: 0, itemsWithQty: 0 });
+  }, [decoratedItems, itemStats]);
+
+  const productSummary = useMemo<ProductSummary[]>(() => products.map((p): ProductSummary => {
+    const its = decoratedItems.filter((i) => i.product_id === p.id);
+    const initial: ProductSummary = {
+      ...p,
+      id: String(p.id),
+      name: String(p.name || "Unnamed product"),
+      required: 0,
+      completed: 0,
+      inProduction: 0,
+      remaining: 0,
+      lines: 0,
+    };
+    return its.reduce<ProductSummary>((acc, item) => {
+      const s = itemStats(item);
+      acc.required += s.target;
+      acc.completed += s.completed;
+      acc.inProduction += s.inProduction;
+      acc.remaining += s.remaining;
+      acc.lines++;
+      return acc;
+    }, initial);
+  }), [products, decoratedItems, itemStats]);
+
+  const filteredItems = useMemo(() => decoratedItems.filter((item) => {
+    const q = search.trim().toLowerCase();
+    return (!q || `${item.name} ${item.product} ${item.material}`.toLowerCase().includes(q)) && (productFilter === "all" || item.product_id === productFilter);
+  }), [decoratedItems, search, productFilter]);
+  const filteredJobs = useMemo(() => jobs.filter((job) => {
+    const item = getItem(job.item_id);
+    const q = search.trim().toLowerCase();
+    return (!q || `${item?.name || ""} ${productMap[item?.product_id]?.name || ""} ${job.printer_name || ""} ${job.vendor_name || ""} ${job.status}`.toLowerCase().includes(q)) && (jobStatusFilter === "all" || job.status === jobStatusFilter);
+  }), [jobs, getItem, productMap, search, jobStatusFilter]);
+
+  async function sendLoginLink(e: FormEvent) {
+    e.preventDefault();
+    if (!supabase || !authEmail.trim()) return;
+    setAuthBusy(true); setToast(null);
+    const { error } = await supabase.auth.signInWithOtp({ email: authEmail.trim().toLowerCase(), options: { emailRedirectTo: `${window.location.origin}/auth/callback`, shouldCreateUser: false } });
+    setAuthBusy(false);
+    if (error) flash("error", error.message);
+    else setLoginSent(true);
+  }
+
+  async function signOut() {
+    if (!supabase) return;
+    await supabase.auth.signOut();
+    setSessionUser(null); setLoginSent(false); setAuthEmail(""); setToast(null);
+  }
+
+  async function saveItem(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !canEdit) return;
+    const form = new FormData(e.currentTarget);
+    const payload = {
+      product_id: String(form.get("product_id") || ""), name: String(form.get("name") || "").trim(),
+      target_quantity: Math.max(0, Number(form.get("target_quantity") || 0)),
+      material: String(form.get("material") || "PLA"), weight_per_part_g: Math.max(0, Number(form.get("weight_per_part_g") || 0)),
+      print_time_hours: Math.max(0, Number(form.get("print_time_hours") || 0)), infill_percent: Math.max(0, Math.min(100, Number(form.get("infill_percent") || 0))),
+      wall_loops: Math.max(0, Number(form.get("wall_loops") || 0)), ironing: form.get("ironing") === "on", notes: String(form.get("notes") || "").trim(),
+    };
+    const query = itemModal && itemModal.id ? await supabase.from("items").update(payload).eq("id", itemModal.id) : await supabase.from("items").insert(payload);
+    if (query.error) { flash("error", query.error.message); return; }
+    setItemModal(false);
+    if (sessionUser) await loadData(sessionUser);
+    flash("success", itemModal && itemModal.id ? "Item settings saved." : "Item added to production list.");
+  }
+
+  async function addJob(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!supabase || !canEdit || !sessionUser) return;
+    const form = new FormData(e.currentTarget);
+    const source = String(form.get("source") || "internal");
+    const payload = {
+      item_id: String(form.get("item_id") || ""), source,
+      printer_name: source === "internal" ? String(form.get("printer_name") || "P1") : null,
+      vendor_name: source === "outside" ? String(form.get("vendor_name") || "Fraxus").trim() || "Fraxus" : null,
+      planned_quantity: Math.max(1, Number(form.get("planned_quantity") || 1)), completed_quantity: 0,
+      status: String(form.get("status") || "queued"), notes: String(form.get("notes") || "").trim(), created_by: sessionUser.id, updated_by: sessionUser.id,
+    };
+    const { error } = await supabase.from("print_jobs").insert(payload);
+    if (error) { flash("error", error.message.includes("print_jobs_one_active_per_printer") ? `${payload.printer_name} already has a job marked Printing. Finish or pause it before assigning another active job.` : error.message); return; }
+    setJobModal(false);
+    if (sessionUser) await loadData(sessionUser);
+    flash("success", "Print job created. Production counts have been refreshed.");
+  }
+
+  async function updateJob(job: AnyRow, changes: AnyRow) {
+    if (!supabase || !canEdit || !sessionUser) return;
+    const payload = { ...changes, updated_by: sessionUser.id };
+    const { error } = await supabase.from("print_jobs").update(payload).eq("id", job.id);
+    if (error) { flash("error", error.message.includes("print_jobs_one_active_per_printer") ? `${job.printer_name} already has another active print job.` : error.message); if (sessionUser) await loadData(sessionUser); return; }
+    await loadData(sessionUser);
+    if (changes.status === "completed") flash("success", "Job completed — its quantity is now included in the completed totals.");
+    else if (changes.status === "failed") flash("info", "Job marked failed. Its completed quantity is zero; create a new job for the reprint.");
+    else flash("success", "Print job updated.");
+  }
+
+  async function inviteMember(e: FormEvent) {
+    e.preventDefault();
+    if (!inviteEmail.trim()) return;
+    setInviteBusy(true);
+    try {
+      const response = await fetch("/api/invite", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: inviteEmail.trim(), role: inviteRole }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Invitation failed.");
+      setInviteEmail("");
+      flash("success", result.message || "Invitation sent.");
+      if (sessionUser) await loadData(sessionUser);
+    } catch (err: any) { flash("error", err.message || "Invitation failed."); }
+    finally { setInviteBusy(false); }
+  }
+
+  async function changeMemberRole(member: AnyRow, nextRole: string) {
+    if (!supabase || !isAdmin) return;
+    const { error } = await supabase.from("app_members").update({ role: nextRole }).eq("user_id", member.user_id);
+    if (error) { flash("error", error.message); return; }
+    if (sessionUser) await loadData(sessionUser);
+    flash("success", `Updated ${member.email}'s role.`);
+  }
+
+  if (!authReady) return <div className="loading-screen"><div className="brand-mark">P</div><span>Opening PrintOps workspace…</span></div>;
+  if (configMissing) return <main className="auth-screen"><div className="auth-card"><div className="brand-lockup"><div className="brand-mark">P</div><div><div className="brand-title">PrintOps</div><div className="brand-sub">3D production workspace</div></div></div><div className="auth-title">Connect your database</div><p className="muted">This app needs a Supabase project before it can sign in or save shared production data.</p><div className="setup-callout"><strong>Next step</strong><span>Copy <code>.env.example</code> to <code>.env.local</code> and add your Supabase URL and public anon key. Follow the included README to create tables and deploy.</span></div></div></main>;
+  if (!sessionUser) return <main className="auth-screen"><div className="auth-card"><div className="brand-lockup"><div className="brand-mark">P</div><div><div className="brand-title">PrintOps</div><div className="brand-sub">3D production workspace</div></div></div><div className="eyebrow">TEAM WORKSPACE · INVITE ONLY</div><h1 className="auth-title">Production, at a glance.</h1><p className="muted">Track each part from queued print to completed quantity. Printers, outsourced work and item settings stay in one shared place.</p>{loginSent ? <div className="sent-card"><div className="sent-icon">✉</div><strong>Check your inbox</strong><span>We sent a secure sign-in link to <b>{authEmail}</b>. Open it on this device to enter the workspace.</span><button className="button button-quiet full" onClick={() => setLoginSent(false)}>Use another email</button></div> : <form onSubmit={sendLoginLink} className="login-form"><label>Email address</label><input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="you@company.com" required autoComplete="email"/><button className="button button-primary full" disabled={authBusy}>{authBusy ? "Sending secure link…" : "Email me a sign-in link →"}</button><p className="tiny muted">Only teammates invited by an admin can sign in. New account registration is disabled.</p></form>}<div className="auth-foot"><span className="dot dot-green"/> Private workspace · Shared live data</div>{toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}</div></main>;
+
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand-lockup"><div className="brand-mark">P</div><div><div className="brand-title">PrintOps</div><div className="brand-sub">PRODUCTION CONTROL</div></div></div>
+      <div className="workspace-label">WORKSPACE</div>
+      <nav className="main-nav">
+        <button className={`nav-link ${tab === "overview" ? "active" : ""}`} onClick={() => setTab("overview")}><span className="nav-symbol">◫</span>Overview</button>
+        <button className={`nav-link ${tab === "production" ? "active" : ""}`} onClick={() => setTab("production")}><span className="nav-symbol">▤</span>Production list<span className="nav-count">{items.length}</span></button>
+        <button className={`nav-link ${tab === "jobs" ? "active" : ""}`} onClick={() => setTab("jobs")}><span className="nav-symbol">⌁</span>Print jobs<span className="nav-count">{jobs.length}</span></button>
+        {isAdmin && <button className={`nav-link ${tab === "team" ? "active" : ""}`} onClick={() => setTab("team")}><span className="nav-symbol">♧</span>Team access</button>}
+      </nav>
+      <div className="sidebar-divider"/>
+      <div className="sidebar-label">PRINTER FLEET</div>
+      <div className="printer-mini-list">{["P1", "P2", "P3", "P4"].map((name) => { const active = jobs.find((j) => j.source === "internal" && j.printer_name === name && j.status === "printing"); const queued = jobs.filter((j) => j.source === "internal" && j.printer_name === name && j.status === "queued").length; return <div className="printer-mini" key={name}><span className={`printer-state ${active ? "busy" : "idle"}`}/><span className="printer-name">{name}</span><span className="printer-job">{active ? "Printing" : queued ? `${queued} queued` : "Available"}</span></div>; })}</div>
+      <div className="sidebar-bottom"><div className="online-chip"><span className="dot dot-green"/> Live database</div><div className="user-row"><div className="avatar">{initials(sessionUser.email)}</div><div className="user-info"><strong>{sessionUser.email?.split("@")[0]}</strong><span>{role}</span></div><button title="Sign out" className="icon-button signout" onClick={signOut}>↗</button></div></div>
+    </aside>
+
+    <main className="main-area">
+      <header className="topbar"><div><div className="breadcrumbs">Workspace <span>/</span> <b>{tab === "overview" ? "Overview" : tab === "production" ? "Production list" : tab === "jobs" ? "Print jobs" : "Team access"}</b></div><div className="page-title-row"><h1>{tab === "overview" ? "Production overview" : tab === "production" ? "Production list" : tab === "jobs" ? "Print jobs" : "Team access"}</h1><span className="live-badge"><i/> LIVE</span></div></div><div className="topbar-actions"><div className="current-user-pill"><span className="avatar small-avatar">{initials(sessionUser.email)}</span><span>{sessionUser.email}</span><span className="role-chip">{role}</span></div>{canEdit && <button className="button button-primary" onClick={() => { setJobSource("internal"); setJobModal(true); }}>＋ New print job</button>}</div></header>
+
+      {tab === "overview" && <div className="page-content">
+        <section className="welcome-row"><div><div className="eyebrow">PRODUCTION SNAPSHOT</div><h2>Keep every part moving.</h2><p>Live status across four products, internal printers and outsourced work.</p></div><div className="snapshot-date"><span className="calendar-glyph">▦</span><div><small>WORKSPACE STATUS</small><strong>{loadingData ? "Syncing data…" : "All changes synced"}</strong></div><span className={`dot ${loadingData ? "dot-amber" : "dot-green"}`}/></div></section>
+        <section className="metric-grid">
+          <MetricCard label="Total units required" value={fmtNum(totals.required)} detail={`${totals.itemsWithQty} item lines have a target`} accent="blue" icon="◎"/>
+          <MetricCard label="Units completed" value={fmtNum(totals.completed)} detail={`${totals.required ? fmtNum(totals.completed / totals.required * 100, 1) : "0"}% of planned quantity`} accent="green" icon="✓"/>
+          <MetricCard label="In production / queued" value={fmtNum(totals.inProduction)} detail="Across internal and outside jobs" accent="violet" icon="↗"/>
+          <MetricCard label="Units still required" value={fmtNum(totals.remaining)} detail="Required quantity minus completed" accent="orange" icon="◷"/>
+        </section>
+        <section className="overview-grid">
+          <div className="panel product-panel"><div className="panel-heading"><div><div className="eyebrow">BY PRODUCT</div><h3>Production progress</h3></div><button className="text-button" onClick={() => setTab("production")}>View production list ↗</button></div>
+            <div className="product-list">{productSummary.map((p) => { const pct = p.required ? Math.min(100, p.completed / p.required * 100) : 0; return <div className="product-progress" key={p.id}><div className="product-progress-top"><div className="product-id"><span className={`product-avatar p-${p.name.toLowerCase().replace(/\s/g, "-")}`}>{p.name === "Lanyard Stand" ? "LS" : p.name}</span><div><strong>{p.name}</strong><span>{p.lines} item types</span></div></div><div className="product-qty"><strong>{fmtNum(p.completed)} <span>/ {fmtNum(p.required)}</span></strong><small>units complete</small></div></div><div className="progress-track"><div className="progress-fill" style={{ width: `${pct}%` }}/></div><div className="progress-foot"><span>{fmtNum(p.inProduction)} in production</span><span>{p.required ? `${fmtNum(pct, 1)}% complete` : "Set quantities to start"}</span></div></div>; })}</div>
+          </div>
+          <div className="panel fleet-panel"><div className="panel-heading"><div><div className="eyebrow">CAPACITY</div><h3>Printer fleet</h3></div><span className="fleet-count">4 PRINTERS</span></div><div className="fleet-grid">{["P1", "P2", "P3", "P4"].map((name) => { const active = jobs.find((j) => j.source === "internal" && j.printer_name === name && j.status === "printing"); const queued = jobs.filter((j) => j.source === "internal" && j.printer_name === name && j.status === "queued"); const jobItem = active ? getItem(active.item_id) : null; return <div className={`fleet-tile ${active ? "fleet-active" : ""}`} key={name}><div className="fleet-tile-head"><span className="printer-glyph">▥</span><span className={`status-pill ${active ? "printing" : "idle"}`}>{active ? "Printing" : "Idle"}</span></div><strong className="fleet-printer-name">{name}</strong><span className="fleet-part">{jobItem?.name || (queued.length ? `${queued.length} job${queued.length > 1 ? "s" : ""} queued` : "No active job")}</span>{active && <div className="fleet-job-meta">{productMap[jobItem?.product_id]?.name || ""} · {active.planned_quantity} units</div>}</div>; })}</div><div className="fleet-note"><span className="dot dot-green"/> One active print job per printer is enforced by the database.</div></div>
+        </section>
+        <section className="panel recent-panel"><div className="panel-heading"><div><div className="eyebrow">LATEST ACTIVITY</div><h3>Recent print jobs</h3></div><button className="text-button" onClick={() => setTab("jobs")}>All print jobs ↗</button></div>{jobs.length ? <div className="table-scroll"><table><thead><tr><th>PART / PRODUCT</th><th>PRINT METHOD</th><th>ASSIGNMENT</th><th>QUANTITY</th><th>STATUS</th></tr></thead><tbody>{jobs.slice(0, 5).map((j) => <JobRow key={j.id} job={j} item={getItem(j.item_id)} productName={productMap[getItem(j.item_id)?.product_id]?.name || "—"} compact/> )}</tbody></table></div> : <EmptyState icon="⌁" title="No print jobs yet" text="Create a job to assign a part to P1–P4 or send it to Fraxus." action={canEdit ? <button className="button button-primary" onClick={() => setJobModal(true)}>＋ Create first job</button> : null}/>}</section>
+      </div>}
+
+      {tab === "production" && <div className="page-content"><div className="section-intro"><div><p className="eyebrow">PARTS MASTER</p><h2>Required vs. completed</h2><p>Item targets and settings come from your updated workbook. Complete a print job to increase its completed quantity automatically.</p></div>{canEdit && <button className="button button-primary" onClick={() => setItemModal(null)}>＋ Add item</button>}</div><div className="filter-toolbar"><div className="search-box"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products or parts…"/></div><select value={productFilter} onChange={(e) => setProductFilter(e.target.value)} aria-label="Filter product"><option value="all">All products</option>{products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select><div className="toolbar-spacer"/><span className="result-count">{filteredItems.length} item lines</span></div><div className="panel table-panel"><div className="table-scroll"><table className="production-table"><thead><tr><th>PRODUCT / ITEM</th><th>REQUIRED</th><th>COMPLETE</th><th>IN PRODUCTION</th><th>REMAINING</th><th>MATERIAL / PART</th><th>PRINT SETTINGS</th><th>PROGRESS</th><th></th></tr></thead><tbody>{filteredItems.map((item) => { const s = itemStats(item); return <tr key={item.id}><td><div className="part-cell"><span className={`product-avatar p-${item.product.toLowerCase().replace(/\s/g, "-")}`}>{item.product === "Lanyard Stand" ? "LS" : item.product}</span><div><strong>{item.name}</strong><span>{item.product}</span></div></div></td><td className="number-cell">{fmtNum(s.target)}</td><td><span className="complete-number">{fmtNum(s.completed)}</span></td><td><span className={`in-production-number ${s.inProduction ? "has-production" : ""}`}>{fmtNum(s.inProduction)}</span><div className="sub-number">{s.printing ? `${s.printing} printing` : ""}{s.printing && s.queued ? " · " : ""}{s.queued ? `${s.queued} queued` : ""}</div></td><td><strong className={s.remaining ? "remaining-number" : "complete-number"}>{fmtNum(s.remaining)}</strong></td><td><strong>{item.material === "Not set" ? <span className="needs-setup">Not set</span> : item.material}</strong><span className="cell-sub">{fmtNum(Number(item.weight_per_part_g), 2)} g · {fmtHours(Number(item.print_time_hours))}/part</span></td><td><div className="setting-chips"><span>{item.infill_percent}% infill</span><span>{item.wall_loops} walls</span><span>Ironing {item.ironing ? "Yes" : "No"}</span></div></td><td><div className="inline-progress"><div className="progress-track"><div className="progress-fill" style={{ width: `${s.progress}%` }}/></div><span>{s.target ? `${fmtNum(s.progress, 0)}%` : "—"}</span></div></td><td>{canEdit && <button className="icon-button" title="Edit item settings" onClick={() => setItemModal(item)}>✎</button>}</td></tr>; })}</tbody></table></div>{!filteredItems.length && <EmptyState icon="⌕" title="No matching items" text="Try a different search or product filter."/>}<div className="table-total"><div><strong>Production total</strong><span>{items.length} part types across {products.length} products</span></div><div className="total-stat"><small>Required</small><strong>{fmtNum(totals.required)}</strong></div><div className="total-stat"><small>Complete</small><strong className="complete-number">{fmtNum(totals.completed)}</strong></div><div className="total-stat"><small>Remaining</small><strong>{fmtNum(totals.remaining)}</strong></div><button className="button button-quiet" onClick={() => setTab("jobs")}>Manage jobs →</button></div></div><div className="info-banner"><span>ⓘ</span><p><strong>Quantity logic:</strong> Completed totals are calculated from recorded print jobs. Marking a job <b>Completed</b> adds its planned quantity; failed jobs count as zero and can be reprinted with a new job. Lanyard Stand target quantities and settings were missing in the workbook, so they are left at zero / not set for you to fill in.</p></div></div>}
+
+      {tab === "jobs" && <div className="page-content"><div className="section-intro"><div><p className="eyebrow">SHOP FLOOR</p><h2>Print job control</h2><p>Assign jobs to P1–P4 or track work with an outside partner. Each completed job updates the item count once, even when the list is refreshed.</p></div>{canEdit && <button className="button button-primary" onClick={() => { setJobSource("internal"); setJobModal(true); }}>＋ New print job</button>}</div><div className="job-summary-strip"><div><span className="legend-swatch swatch-printing"/><strong>{jobs.filter((j) => j.status === "printing").length}</strong><small>Printing now</small></div><div><span className="legend-swatch swatch-queued"/><strong>{jobs.filter((j) => j.status === "queued").length}</strong><small>Queued</small></div><div><span className="legend-swatch swatch-complete"/><strong>{jobs.filter((j) => j.status === "completed").length}</strong><small>Completed jobs</small></div><div><span className="legend-swatch swatch-failed"/><strong>{jobs.filter((j) => j.status === "failed").length}</strong><small>Failed / reprint</small></div></div><div className="filter-toolbar"><div className="search-box"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search part, printer or vendor…"/></div><select value={jobStatusFilter} onChange={(e) => setJobStatusFilter(e.target.value)} aria-label="Filter job status"><option value="all">All statuses</option>{Object.keys(STATUS_LABELS).map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}</select><div className="toolbar-spacer"/><span className="result-count">{filteredJobs.length} jobs</span></div><div className="panel table-panel"><div className="table-scroll"><table className="jobs-table"><thead><tr><th>PART / PRODUCT</th><th>METHOD</th><th>PRINTER / VENDOR</th><th>PLANNED</th><th>DONE QTY</th><th>STATUS</th><th>CREATED</th></tr></thead><tbody>{filteredJobs.map((j) => <JobRow key={j.id} job={j} item={getItem(j.item_id)} productName={productMap[getItem(j.item_id)?.product_id]?.name || "—"} editable={canEdit} onStatusChange={(status) => updateJob(j, { status })} onDoneChange={(qty) => updateJob(j, { completed_quantity: qty })}/> )}</tbody></table></div>{!filteredJobs.length && <EmptyState icon="⌁" title="No print jobs found" text={canEdit ? "Create a job to begin tracking a part." : "There are no jobs for these filters yet."} action={canEdit ? <button className="button button-primary" onClick={() => setJobModal(true)}>＋ Create print job</button> : null}/>}</div><div className="info-banner"><span>ⓘ</span><p><strong>Printer rule:</strong> only one job can be marked <b>Printing</b> on P1, P2, P3 or P4 at a time. If a job fails, it records zero completed units; create another job to track the reprint. For outside jobs, select the outside method and enter Fraxus or the supplier name.</p></div></div>}
+
+      {tab === "team" && isAdmin && <div className="page-content"><div className="section-intro"><div><p className="eyebrow">WORKSPACE ACCESS</p><h2>Invite your team</h2><p>Only invited members can sign in. Give teammates Editor access to update jobs or Viewer access to see production progress.</p></div><div className="team-total"><strong>{members.length}</strong><span>workspace members</span></div></div><div className="team-layout"><div className="panel invite-panel"><div className="panel-heading"><div><div className="eyebrow">ADD A MEMBER</div><h3>Send an invitation</h3></div><span className="invite-icon">✉</span></div><form className="invite-form" onSubmit={inviteMember}><label>Work email</label><input type="email" value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} placeholder="teammate@company.com" required/><label>Permission level</label><select value={inviteRole} onChange={(e) => setInviteRole(e.target.value)}><option value="editor">Editor — view and change production data</option><option value="viewer">Viewer — read-only access</option></select><button className="button button-primary full" disabled={inviteBusy}>{inviteBusy ? "Sending invitation…" : "Send invite →"}</button><p className="tiny muted">An invitation email will be sent through Supabase Auth. Keep the service-role key only in hosting environment variables.</p></form></div><div className="panel members-panel"><div className="panel-heading"><div><div className="eyebrow">AUTHORIZED MEMBERS</div><h3>Workspace access</h3></div><span className="fleet-count">{members.length} MEMBERS</span></div><div className="member-list">{members.map((m) => <div className="member-row" key={m.user_id}><div className="avatar">{initials(m.email)}</div><div className="member-detail"><strong>{m.email}</strong><span>{m.user_id === sessionUser.id ? "You · " : ""}Added {new Date(m.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</span></div>{m.user_id === sessionUser.id ? <span className="role-chip">Admin (you)</span> : <select className="role-select" value={m.role} onChange={(e) => changeMemberRole(m, e.target.value)} aria-label={`Role for ${m.email}`}><option value="viewer">Viewer</option><option value="editor">Editor</option><option value="admin">Admin</option></select>}</div>)}</div></div></div><div className="permissions-grid"><div><span className="permission-dot admin-dot"/><div><strong>Admin</strong><p>Manage invitations and roles, edit production, item settings and print jobs.</p></div></div><div><span className="permission-dot editor-dot"/><div><strong>Editor</strong><p>Update part settings, assign printers, create and update print jobs.</p></div></div><div><span className="permission-dot viewer-dot"/><div><strong>Viewer</strong><p>View production totals, item settings, printer status and job history.</p></div></div></div></div>}
+
+      <footer className="footer"><span>PRINTOPS · Shared 3D production tracker</span><span>Data access is controlled by your Supabase workspace membership.</span></footer>
+    </main>
+
+    {itemModal !== false && <Modal title={itemModal?.id ? "Edit item settings" : "Add production item"} kicker="PART MASTER" onClose={() => setItemModal(false)}><form className="modal-form" onSubmit={saveItem}><div className="form-grid"><div className="field full-field"><label>Product</label><select name="product_id" required defaultValue={itemModal?.product_id || products[0]?.id}>{products.map((p) => <option value={p.id} key={p.id}>{p.name}</option>)}</select></div><div className="field full-field"><label>Item / part name</label><input name="name" required defaultValue={itemModal?.name || ""} placeholder="e.g. Front Cladding"/></div><div className="field"><label>Required quantity</label><input name="target_quantity" type="number" min="0" step="1" defaultValue={itemModal?.target_quantity ?? 0}/></div><div className="field"><label>Material</label><input name="material" defaultValue={itemModal?.material && itemModal.material !== "Not set" ? itemModal.material : "PLA"}/></div><div className="field"><label>Weight / part (g)</label><input name="weight_per_part_g" type="number" min="0" step="0.01" defaultValue={itemModal?.weight_per_part_g ?? 0}/></div><div className="field"><label>Print time / part (hours)</label><input name="print_time_hours" type="number" min="0" step="0.01" defaultValue={itemModal?.print_time_hours ?? 0}/></div><div className="field"><label>Infill (%)</label><input name="infill_percent" type="number" min="0" max="100" step="1" defaultValue={itemModal?.infill_percent ?? 20}/></div><div className="field"><label>Wall loops (integer)</label><input name="wall_loops" type="number" min="0" step="1" defaultValue={itemModal?.wall_loops ?? 3}/></div><div className="field"><label>Ironing</label><select name="ironing" defaultValue={itemModal?.ironing ? "on" : "off"}><option value="off">No</option><option value="on">Yes</option></select></div><div className="field full-field"><label>Notes</label><textarea name="notes" rows={2} defaultValue={itemModal?.notes || ""} placeholder="Material, finishing or supplier notes"/></div></div><div className="modal-footer"><button type="button" className="button button-quiet" onClick={() => setItemModal(false)}>Cancel</button><button className="button button-primary">{itemModal?.id ? "Save item settings" : "Add item"}</button></div></form></Modal>}
+
+    {jobModal && <Modal title="Create a print job" kicker="NEW PRODUCTION BATCH" onClose={() => setJobModal(false)}><form className="modal-form" onSubmit={addJob}><div className="field full-field"><label>Part to print</label><select name="item_id" required defaultValue={decoratedItems[0]?.id}>{decoratedItems.map((i) => <option key={i.id} value={i.id}>{i.product} — {i.name} (need {itemStats(i).remaining})</option>)}</select></div><div className="field full-field"><label>Printing method</label><div className="segmented"><button type="button" className={jobSource === "internal" ? "selected" : ""} onClick={() => setJobSource("internal")}>⌂ In-house printers</button><button type="button" className={jobSource === "outside" ? "selected" : ""} onClick={() => setJobSource("outside")}>↗ Outside company</button></div><input type="hidden" name="source" value={jobSource}/></div>{jobSource === "internal" ? <div className="field full-field"><label>Printer assignment</label><div className="printer-choice-grid">{["P1", "P2", "P3", "P4"].map((p) => { const active = jobs.find((j) => j.printer_name === p && j.status === "printing"); return <label className={`printer-choice ${active ? "choice-busy" : ""}`} key={p}><input type="radio" name="printer_name" value={p} defaultChecked={p === "P1"}/><span className="printer-choice-name">{p}</span><span>{active ? "Busy" : "Available"}</span></label>; })}</div><p className="field-hint">Only one job can be marked Printing on a printer at a time. You can queue more than one.</p></div> : <div className="field full-field"><label>Outside company / vendor</label><input name="vendor_name" defaultValue="Fraxus" placeholder="Fraxus"/></div>}<div className="field"><label>Planned quantity</label><input name="planned_quantity" type="number" required min="1" step="1" defaultValue="1"/></div><div className="field"><label>Initial status</label><select name="status" defaultValue="queued"><option value="queued">Queued</option><option value="printing" disabled={jobSource === "outside"}>Printing now</option></select></div><div className="field full-field"><label>Job notes</label><textarea rows={2} name="notes" placeholder="Batch number, due date, special instructions…"/></div><div className="modal-footer"><button type="button" className="button button-quiet" onClick={() => setJobModal(false)}>Cancel</button><button className="button button-primary">Create print job</button></div></form></Modal>}
+
+    {toast && <div className={`toast ${toast.kind}`} role="status"><span>{toast.kind === "success" ? "✓" : toast.kind === "error" ? "!" : "i"}</span>{toast.text}<button onClick={() => setToast(null)} aria-label="Dismiss message">×</button></div>}
+  </div>;
+}
+
+function MetricCard({ label, value, detail, accent, icon }: { label: string; value: string; detail: string; accent: string; icon: string }) {
+  return <div className={`metric-card ${accent}`}><div className="metric-top"><span>{label}</span><span className="metric-icon">{icon}</span></div><div className="metric-value">{value}</div><div className="metric-detail">{detail}</div></div>;
+}
+function EmptyState({ icon, title, text, action }: { icon: string; title: string; text: string; action?: ReactNode }) {
+  return <div className="empty-state"><div className="empty-icon">{icon}</div><strong>{title}</strong><p>{text}</p>{action}</div>;
+}
+function Modal({ title, kicker, onClose, children }: { title: string; kicker: string; onClose: () => void; children: ReactNode }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className="modal-card" role="dialog" aria-modal="true" aria-label={title}><header className="modal-header"><div><div className="eyebrow">{kicker}</div><h3>{title}</h3></div><button className="icon-button close-button" onClick={onClose} aria-label="Close dialog">×</button></header>{children}</section></div>;
+}
+function JobRow({ job, item, productName, compact = false, editable = false, onStatusChange, onDoneChange }: { job: AnyRow; item?: AnyRow; productName: string; compact?: boolean; editable?: boolean; onStatusChange?: (status: string) => void; onDoneChange?: (quantity: number) => void }) {
+  return <tr><td><div className="job-part"><strong>{item?.name || "Deleted item"}</strong><span>{productName}</span></div></td><td><span className={`method-chip ${job.source === "outside" ? "outside" : "internal"}`}>{job.source === "outside" ? "↗ Outside" : "⌂ In-house"}</span></td><td><div className="assignment-cell"><strong>{job.source === "outside" ? job.vendor_name || "Fraxus" : job.printer_name}</strong><span>{job.source === "outside" ? "External vendor" : "3D printer"}</span></div></td><td className="number-cell">{fmtNum(job.planned_quantity)}</td><td>{job.status === "completed" || job.status === "failed" || !editable ? <strong className={job.status === "completed" ? "complete-number" : ""}>{fmtNum(job.completed_quantity)}</strong> : <input className="qty-input" aria-label="Completed quantity" type="number" min="0" max={job.planned_quantity} defaultValue={job.completed_quantity} onBlur={(e) => { const q = Math.max(0, Math.min(Number(job.planned_quantity), Number(e.target.value || 0))); if (q !== Number(job.completed_quantity)) onDoneChange?.(q); }} />}</td><td>{editable ? <select className={`status-select ${STATUS_CLASS[job.status] || ""}`} value={job.status} onChange={(e) => onStatusChange?.(e.target.value)} aria-label="Change print job status">{Object.keys(STATUS_LABELS).map((s) => <option key={s} value={s}>{STATUS_LABELS[s]}</option>)}</select> : <span className={`status-pill ${STATUS_CLASS[job.status] || ""}`}>{STATUS_LABELS[job.status] || job.status}</span>}</td><td><span className="date-cell">{new Date(job.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" })}</span>{!compact && job.notes ? <span className="cell-sub note-snippet" title={job.notes}>{job.notes}</span> : null}</td></tr>;
+}
