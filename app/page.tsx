@@ -40,7 +40,7 @@ const STATUS_LABELS: Record<string, string> = {
 const STATUS_CLASS: Record<string, string> = {
   queued: "queued", printing: "printing", failed: "failed", completed: "completed", cancelled: "cancelled",
 };
-const PRINTER_NAMES = ["P1", "P2", "P3", "P4"] as const;
+const PRINTER_NAMES = ["P1", "P2", "P3", "P4", "P5"] as const;
 const PART_FILES_BUCKET = "production-files";
 const MAX_PART_FILE_BYTES = 100 * 1024 * 1024;
 const PRINTER_HEALTH_LABELS: Record<string, string> = {
